@@ -3,6 +3,9 @@ import sqlite3
 import re
 import asyncio
 import logging
+import os
+import threading
+from flask import Flask
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -11,8 +14,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ========== НАСТРОЙКИ ==========
-BOT_TOKEN = "8827573585:AAH9ac0ZS3xfl8D6iayPL1v7yX8cME2Lcao"  # ЗАМЕНИТЕ НА СВОЙ
-ADMIN_ID = 1239648336  # ВАШ ID
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # БЕРЕМ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ!
+if not BOT_TOKEN:
+    raise ValueError("Токен не найден. Установите переменную TELEGRAM_TOKEN")
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(token=BOT_TOKEN)
@@ -83,7 +87,7 @@ def get_style_fact(style):
 class GameStates(StatesGroup):
     waiting_for_answer = State()
 
-# ========== КОМАНДА /START ==========
+# ========== КОМАНДЫ ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -93,7 +97,6 @@ async def cmd_start(message: types.Message):
         parse_mode="Markdown"
     )
 
-# ========== КОМАНДА /PLAY ==========
 @dp.message(Command("play"))
 async def cmd_play(message: types.Message, state: FSMContext):
     building = get_random_building()
@@ -103,7 +106,6 @@ async def cmd_play(message: types.Message, state: FSMContext):
     
     variants = get_style_variants(building['style'])
     
-    # Сохраняем данные в состояние
     await state.update_data(
         building_id=building['id'],
         correct_style=building['style'],
@@ -113,7 +115,6 @@ async def cmd_play(message: types.Message, state: FSMContext):
         full_caption=building['full_caption']
     )
     
-    # Создаём кнопки с ЦИФРАМИ (гарантированно без точек и проблем)
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"1️⃣ {variants[0]}", callback_data="ans_0")],
@@ -131,7 +132,6 @@ async def cmd_play(message: types.Message, state: FSMContext):
     
     await state.set_state(GameStates.waiting_for_answer)
 
-# ========== ОБРАБОТКА ОТВЕТА ==========
 @dp.callback_query(GameStates.waiting_for_answer)
 async def handle_answer(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -143,7 +143,6 @@ async def handle_answer(callback: types.CallbackQuery, state: FSMContext):
     year = data.get('year', 'неизвестном')
     full_caption = data.get('full_caption', '')
     
-    # Получаем индекс выбранного варианта (0, 1, 2)
     chosen_index = int(callback.data.replace("ans_", ""))
     chosen_style = variants[chosen_index]
     
@@ -176,103 +175,28 @@ async def handle_answer(callback: types.CallbackQuery, state: FSMContext):
     )
     await state.clear()
 
-# ========== КНОПКА "ИГРАТЬ СНОВА" ==========
 @dp.callback_query(lambda c: c.data == "play_again")
 async def play_again(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.delete()
     await cmd_play(callback.message, state)
 
-# ========== КОМАНДА /ADD ДЛЯ АДМИНА ==========
-@dp.message(Command("add"))
-async def add_building(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("🚫 Доступ запрещён")
-        return
-    
-    try:
-        parts = message.text.replace('/add ', '').split('|')
-        photo_id = parts[0].strip()
-        name = parts[1].strip()
-        year = int(parts[2].strip())
-        style = parts[3].strip()
-        full_caption = parts[4].strip()
-        
-        conn = sqlite3.connect('buildings.db')
-        cur = conn.cursor()
-        cur.execute(
-            'INSERT INTO buildings (photo_file_id, name, year, style, full_caption) VALUES (?, ?, ?, ?, ?)',
-            (photo_id, name, year, style, full_caption)
-        )
-        conn.commit()
-        conn.close()
-        await message.answer(f"✅ Добавлено: {name} ({style})")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка! Пример:\n/add AgACAgI...|Театр|1886|неорусский стиль|ваша подпись")
+# ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
+web_app = Flask(__name__)
 
-# ========== АВТОДОБАВЛЕНИЕ ПРИ ПЕРЕСЫЛКЕ ==========
-@dp.message(lambda msg: msg.forward_from_chat is not None)
-async def auto_add_from_channel(message: types.Message):
-    if not message.photo:
-        await message.answer("📷 Пожалуйста, перешлите пост с ФОТО.")
-        return
-    
-    caption = message.caption or ""
-    if "архитектурные заметки" not in caption:
-        await message.answer("❌ Это не похоже на пост с архитектурой. Подпись должна содержать '// архитектурные заметки //'")
-        return
-    
-    pattern = r'//\s*архитектурные\s+заметки\s*//\s*(\d+)\s*//\s*(.*?),\s*(\d{4})\s*//\s*(.*?)$'
-    match = re.search(pattern, caption, re.DOTALL)
-    
-    if not match:
-        await message.answer("❌ Не удалось распознать формат подписи.\n\n"
-                            "Ожидаемый формат:\n"
-                            "// архитектурные заметки // 81 // Театр, 1886 // неорусский стиль")
-        return
-    
-    number = match.group(1).strip()
-    name = match.group(2).strip()
-    year = int(match.group(3))
-    style = match.group(4).strip()
-    full_caption = caption.strip()
-    photo_file_id = message.photo[-1].file_id
-    
-    try:
-        conn = sqlite3.connect('buildings.db')
-        cur = conn.cursor()
-        
-        cur.execute('SELECT id FROM buildings WHERE name = ? AND year = ?', (name, year))
-        if cur.fetchone():
-            await message.answer(f"⚠️ Здание '{name}' ({year}) уже есть в базе.")
-            conn.close()
-            return
-        
-        cur.execute('''
-            INSERT INTO buildings (photo_file_id, name, year, style, full_caption)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (photo_file_id, name, year, style, full_caption))
-        
-        conn.commit()
-        conn.close()
-        
-        await message.answer(f"✅ Добавлено: *{name}* ({year})\n"
-                            f"🏛 Стиль: *{style}*",
-                            parse_mode="Markdown")
-        
-        conn = sqlite3.connect('buildings.db')
-        cur = conn.cursor()
-        cur.execute('SELECT COUNT(*) FROM buildings')
-        count = cur.fetchone()[0]
-        conn.close()
-        
-        await message.answer(f"📊 Теперь в базе *{count}* зданий. Напиши /play, чтобы играть!",
-                            parse_mode="Markdown")
-        
-    except Exception as e:
-        await message.answer(f"❌ Ошибка при сохранении: {e}")
+@web_app.route('/')
+def home():
+    return "🤖 Bot is running!"
 
-# ========== ЗАПУСК ==========
+def run_web():
+    port = int(os.environ.get('PORT', 10000))
+    web_app.run(host='0.0.0.0', port=port)
+
+# Запускаем Flask в отдельном потоке
+thread = threading.Thread(target=run_web, daemon=True)
+thread.start()
+
+# ========== ЗАПУСК БОТА ==========
 async def main():
     init_db()
     print("🤖 Бот запущен и готов к работе!")
